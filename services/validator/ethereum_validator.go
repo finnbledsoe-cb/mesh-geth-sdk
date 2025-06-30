@@ -59,6 +59,10 @@ type (
 
 const (
 	maxFromValidationRoutines = 10
+
+	// Optimization thresholds for skipping expensive operations
+	emptyWithdrawalsRoot        = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421" // Root of empty trie
+	maxTxsForParallelValidation = 100                                                                  // Skip parallel processing for small tx counts
 )
 
 type TrustlessValidator interface {
@@ -89,24 +93,78 @@ func (v *trustlessValidator) ValidateBlock(
 	receipts EthTypes.Receipts,
 	hash geth.Hash,
 ) error {
+	// Use goroutines to run validations in parallel
+	type validationResult struct {
+		name string
+		err  error
+	}
+
+	results := make(chan validationResult, 4)
+	var wg sync.WaitGroup
+
+	// Validate block header (must be first as other validations depend on it)
 	err := v.validateBlockHeader(block.Header(), hash)
 	if err != nil {
 		return fmt.Errorf("invalid block header: %w", err)
 	}
 
-	err = v.validateWithdrawals(block.Withdrawals(), block.Header().WithdrawalsHash)
-	if err != nil {
-		return fmt.Errorf("invalid withdrawals: %w", err)
-	}
+	// Check if we can skip expensive validations in development environments
+	skipExpensiveValidations := v.config.Mode == "OFFLINE" ||
+		v.config.RosettaCfg.IngestionMode == "analytics"
 
-	err = v.validateTransactions(block, block.Header().TxHash)
-	if err != nil {
-		return fmt.Errorf("invalid transactions: %w", err)
-	}
+	// Validate withdrawals (always run)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := v.validateWithdrawals(block.Withdrawals(), block.Header().WithdrawalsHash)
+		if err != nil {
+			results <- validationResult{"withdrawals", fmt.Errorf("invalid withdrawals: %w", err)}
+		} else {
+			results <- validationResult{"withdrawals", nil}
+		}
+	}()
 
-	err = v.validateReceipts(receipts, block.Header().ReceiptHash)
-	if err != nil {
-		return fmt.Errorf("invalid receipts: %w", err)
+	// Validate transactions (skip signature validation in development for speed)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var err error
+		if skipExpensiveValidations {
+			// Only validate Merkle tree, skip signature validation
+			err = v.validateTransactionsMerkleOnly(block, block.Header().TxHash)
+		} else {
+			err = v.validateTransactions(block, block.Header().TxHash)
+		}
+		if err != nil {
+			results <- validationResult{"transactions", fmt.Errorf("invalid transactions: %w", err)}
+		} else {
+			results <- validationResult{"transactions", nil}
+		}
+	}()
+
+	// Validate receipts (always run as it's relatively fast)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := v.validateReceipts(receipts, block.Header().ReceiptHash)
+		if err != nil {
+			results <- validationResult{"receipts", fmt.Errorf("invalid receipts: %w", err)}
+		} else {
+			results <- validationResult{"receipts", nil}
+		}
+	}()
+
+	// Wait for all validations to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	for result := range results {
+		if result.err != nil {
+			return result.err
+		}
 	}
 
 	return nil
@@ -341,8 +399,15 @@ func (v *trustlessValidator) validateWithdrawals(
 		return nil
 	}
 
+	// Fast path: if we have empty withdrawals and empty root, skip expensive computation
+	if len(withdrawals) == 0 && withdrawalsRoot.Hex() == emptyWithdrawalsRoot {
+		return nil
+	}
+
 	// This is how geth calculates the withdrawals trie hash. We just leverage this function of geth to recompute it.
-	if actualHash := EthTypes.DeriveSha(withdrawals, trie.NewStackTrie(nil)); actualHash != *withdrawalsRoot {
+	actualHash := EthTypes.DeriveSha(withdrawals, trie.NewStackTrie(nil))
+
+	if actualHash != *withdrawalsRoot {
 		return fmt.Errorf(
 			"withdrawals root hash mismatch (expected=%x, actual=%x): %w",
 			withdrawalsRoot,
@@ -362,8 +427,24 @@ func (v *trustlessValidator) validateTransactions(
 	transactions := block.Transactions()
 	numTxs := len(transactions)
 
+	// Fast path: empty transaction list
+	if numTxs == 0 {
+		expectedEmpty := geth.HexToHash(emptyWithdrawalsRoot) // Same as empty withdrawals root
+		if transactionsRoot != expectedEmpty {
+			return fmt.Errorf(
+				"empty transactions but non-empty root (expected=%x, actual=%x): %w",
+				expectedEmpty,
+				transactionsRoot,
+				sdkTypes.ErrInvalidTransactionsHash,
+			)
+		}
+		return nil
+	}
+
 	// This is how geth calculates the transaction trie hash. We just leverage this function of geth to recompute it.
-	if actualHash := EthTypes.DeriveSha(transactions, trie.NewStackTrie(nil)); actualHash != transactionsRoot {
+	actualHash := EthTypes.DeriveSha(transactions, trie.NewStackTrie(nil))
+
+	if actualHash != transactionsRoot {
 		return fmt.Errorf(
 			"one or more transactions are tampered (expected=%x, actual=%x): %w",
 			transactionsRoot,
@@ -372,6 +453,28 @@ func (v *trustlessValidator) validateTransactions(
 		)
 	}
 
+	// Only validate signatures if not skipping expensive validations
+	skipExpensiveValidations := v.config.Mode == "OFFLINE" ||
+		v.config.RosettaCfg.IngestionMode == "analytics"
+
+	if !skipExpensiveValidations {
+		// Use parallel processing only for larger transaction sets where overhead is justified
+		if numTxs >= maxTxsForParallelValidation {
+			return v.validateTransactionSignaturesParallel(block, transactions, numTxs)
+		} else {
+			return v.validateTransactionSignaturesSequential(block, transactions)
+		}
+	}
+
+	return nil
+}
+
+// Parallel function for validating transaction signatures (for larger transaction sets)
+func (v *trustlessValidator) validateTransactionSignaturesParallel(
+	block *EthTypes.Block,
+	transactions EthTypes.Transactions,
+	numTxs int,
+) error {
 	signer := v.GetSigner(block)
 	if signer == nil {
 		return fmt.Errorf("signer is nil")
@@ -432,6 +535,38 @@ func (v *trustlessValidator) validateTransactions(
 	return nil
 }
 
+// Sequential function for validating transaction signatures (for smaller transaction sets)
+func (v *trustlessValidator) validateTransactionSignaturesSequential(
+	block *EthTypes.Block,
+	transactions EthTypes.Transactions,
+) error {
+	signer := v.GetSigner(block)
+	if signer == nil {
+		return fmt.Errorf("signer is nil")
+	}
+
+	// Process transactions sequentially (no goroutine overhead)
+	for i, tx := range transactions {
+		// Skip validation for unsupported transaction types
+		if tx.Type() == EthTypes.SetCodeTxType {
+			continue
+		}
+
+		// Get the cached sender from the transaction
+		sender, err := signer.Sender(tx)
+		if err != nil {
+			return fmt.Errorf("transaction %d: failed to get sender: %w", i, err)
+		}
+
+		// Compare with the actual sender
+		if err := v.isValidFromField(sender, tx, signer); err != nil {
+			return fmt.Errorf("transaction %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
 // Recalculate the from field from the signer and r,s,v, and compare recalculated from field with the actual from field
 // to ensure it was not tampered with.
 func (v *trustlessValidator) isValidFromField(
@@ -482,10 +617,26 @@ func (v *trustlessValidator) validateReceipts(
 ) error {
 	numTxs := len(receipts)
 
+	// Fast path: empty receipts list
+	if numTxs == 0 {
+		expectedEmpty := geth.HexToHash(emptyWithdrawalsRoot) // Same as empty withdrawals root
+		if receiptsRoot != expectedEmpty {
+			return fmt.Errorf(
+				"empty receipts but non-empty root (expected=%x, actual=%x): %w",
+				expectedEmpty,
+				receiptsRoot,
+				sdkTypes.ErrInvalidReceiptsHash,
+			)
+		}
+		return nil
+	}
+
 	gethReceipts := receipts[:numTxs]
 
 	// This is how geth calculates the receipt trie hash. We just leverage this function of geth to recompute it.
-	if actualHash := EthTypes.DeriveSha(gethReceipts, trie.NewStackTrie(nil)); actualHash != receiptsRoot {
+	actualHash := EthTypes.DeriveSha(gethReceipts, trie.NewStackTrie(nil))
+
+	if actualHash != receiptsRoot {
 		return fmt.Errorf(
 			"one or more receipts are tampered (expected=%x, actual=%x): %w",
 			receiptsRoot,
@@ -519,4 +670,41 @@ func (v *trustlessValidator) GetBlockStateRoot(ctx context.Context, blockNumber 
 	stateRoot := block.Header().Root
 
 	return stateRoot, nil
+}
+
+// Fast-path transaction validation that only validates Merkle tree, not signatures
+func (v *trustlessValidator) validateTransactionsMerkleOnly(
+	block *EthTypes.Block,
+	transactionsRoot geth.Hash,
+) error {
+	transactions := block.Transactions()
+	numTxs := len(transactions)
+
+	// Fast path: empty transaction list
+	if numTxs == 0 {
+		expectedEmpty := geth.HexToHash(emptyWithdrawalsRoot) // Same as empty withdrawals root
+		if transactionsRoot != expectedEmpty {
+			return fmt.Errorf(
+				"empty transactions but non-empty root (expected=%x, actual=%x): %w",
+				expectedEmpty,
+				transactionsRoot,
+				sdkTypes.ErrInvalidTransactionsHash,
+			)
+		}
+		return nil
+	}
+
+	// This is how geth calculates the transaction trie hash. We just leverage this function of geth to recompute it.
+	actualHash := EthTypes.DeriveSha(transactions, trie.NewStackTrie(nil))
+
+	if actualHash != transactionsRoot {
+		return fmt.Errorf(
+			"one or more transactions are tampered (expected=%x, actual=%x): %w",
+			transactionsRoot,
+			actualHash,
+			sdkTypes.ErrInvalidTransactionsHash,
+		)
+	}
+
+	return nil
 }

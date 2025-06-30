@@ -7,7 +7,7 @@ toolchain go1.24.0
 require (
 	github.com/coinbase/rosetta-sdk-go v0.8.9
 	github.com/coinbase/rosetta-sdk-go/types v1.0.0
-	github.com/ethereum/go-ethereum v1.15.5
+	github.com/ethereum/go-ethereum v1.15.6
 	github.com/hashicorp/golang-lru v1.0.2
 	github.com/neilotoole/errgroup v0.1.6
 	github.com/stretchr/testify v1.10.0
