@@ -21,6 +21,7 @@ import (
 	"log"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -59,7 +60,19 @@ type (
 
 const (
 	maxFromValidationRoutines = 10
+	// Cache settings
+	stateRootCacheSize = 1000
+	stateRootCacheTTL  = 30 * time.Minute
+	// Connection pool settings
+	maxIdleConns = 10
+	connTimeout  = 30 * time.Second
 )
+
+// Cache entry for state roots
+type stateRootCacheEntry struct {
+	stateRoot geth.Hash
+	timestamp time.Time
+}
 
 type TrustlessValidator interface {
 	ValidateBlock(block *EthTypes.Block, receipts EthTypes.Receipts, hash geth.Hash) error
@@ -67,10 +80,31 @@ type TrustlessValidator interface {
 	ValidateAccountState(result AccountResult, stateRoot geth.Hash, blockNumber *big.Int) error
 	GetAccountProof(ctx context.Context, account geth.Address, blockNumber *big.Int) (AccountResult, error)
 	GetBlockStateRoot(ctx context.Context, blockNumber *big.Int) (geth.Hash, error)
+	// New batch validation method
+	ValidateAccountsBatch(ctx context.Context, requests []AccountValidationRequest) []error
+	// Cleanup method for connection management
+	Close()
 }
+
+// Request structure for batch validation
+type AccountValidationRequest struct {
+	BalanceResponse *types.AccountBalanceResponse
+	Address         string
+}
+
 type (
 	trustlessValidator struct {
-		config *config.Configuration
+		config         *config.Configuration
+		clientPool     *connectionPool
+		stateRootCache map[int64]*stateRootCacheEntry
+		cacheMutex     sync.RWMutex
+	}
+
+	connectionPool struct {
+		client    *ethclient.Client
+		mutex     sync.Mutex
+		connected bool
+		config    *config.Configuration
 	}
 )
 
@@ -78,10 +112,130 @@ var (
 	_ TrustlessValidator = (*trustlessValidator)(nil)
 )
 
-func NewEthereumValidator(cfg *config.Configuration) TrustlessValidator {
-	return &trustlessValidator{
+// Connection pool implementation
+func newConnectionPool(cfg *config.Configuration) *connectionPool {
+	return &connectionPool{
 		config: cfg,
 	}
+}
+
+func (cp *connectionPool) getClient(ctx context.Context) (*ethclient.Client, error) {
+	cp.mutex.Lock()
+	defer cp.mutex.Unlock()
+
+	if cp.client != nil && cp.connected {
+		return cp.client, nil
+	}
+
+	if cp.config.GethURL == "" {
+		return nil, fmt.Errorf("GethURL not configured")
+	}
+
+	client, err := ethclient.Dial(cp.config.GethURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to blockchain node at %s: %w", cp.config.GethURL, err)
+	}
+
+	cp.client = client
+	cp.connected = true
+	return client, nil
+}
+
+func (cp *connectionPool) close() {
+	cp.mutex.Lock()
+	defer cp.mutex.Unlock()
+
+	if cp.client != nil {
+		cp.client.Close()
+		cp.client = nil
+		cp.connected = false
+	}
+}
+
+func NewEthereumValidator(cfg *config.Configuration) TrustlessValidator {
+	return &trustlessValidator{
+		config:         cfg,
+		clientPool:     newConnectionPool(cfg),
+		stateRootCache: make(map[int64]*stateRootCacheEntry),
+	}
+}
+
+func (v *trustlessValidator) Close() {
+	if v.clientPool != nil {
+		v.clientPool.close()
+	}
+}
+
+// Optimized batch validation method
+func (v *trustlessValidator) ValidateAccountsBatch(ctx context.Context, requests []AccountValidationRequest) []error {
+	errors := make([]error, len(requests))
+	if len(requests) == 0 {
+		return errors
+	}
+
+	// Group requests by block number to optimize state root fetching
+	blockGroups := make(map[int64][]int)
+	for i, req := range requests {
+		blockNum := req.BalanceResponse.BlockIdentifier.Index
+		blockGroups[blockNum] = append(blockGroups[blockNum], i)
+	}
+
+	// Pre-fetch state roots for all unique blocks
+	stateRoots := make(map[int64]geth.Hash)
+	for blockNum := range blockGroups {
+		stateRoot, err := v.GetBlockStateRoot(ctx, big.NewInt(blockNum))
+		if err != nil {
+			// Mark all requests for this block as failed
+			for _, reqIdx := range blockGroups[blockNum] {
+				errors[reqIdx] = fmt.Errorf("failed to get block state root: %w", err)
+			}
+			continue
+		}
+		stateRoots[blockNum] = stateRoot
+	}
+
+	// Process accounts in parallel with controlled concurrency
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, maxFromValidationRoutines)
+
+	for i, req := range requests {
+		if errors[i] != nil {
+			continue // Skip if state root fetch failed
+		}
+
+		wg.Add(1)
+		go func(idx int, request AccountValidationRequest) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			blockNum := request.BalanceResponse.BlockIdentifier.Index
+			stateRoot, exists := stateRoots[blockNum]
+			if !exists {
+				errors[idx] = fmt.Errorf("state root not available for block %d", blockNum)
+				return
+			}
+
+			addr := common.HexToAddress(request.Address)
+			result, err := v.GetAccountProof(ctx, addr, big.NewInt(blockNum))
+			if err != nil {
+				if isProofWindowError(err) {
+					log.Printf("Skipping account validation: block %d is outside proof window\n", blockNum)
+					return
+				}
+				errors[idx] = fmt.Errorf("failed to get account proof: %w", err)
+				return
+			}
+
+			err = v.ValidateAccountState(result, stateRoot, big.NewInt(blockNum))
+			if err != nil {
+				errors[idx] = err
+			}
+		}(i, req)
+	}
+
+	wg.Wait()
+	return errors
 }
 
 func (v *trustlessValidator) ValidateBlock(
@@ -151,6 +305,8 @@ func isProofWindowError(err error) bool {
 		return false
 	}
 
+	fmt.Println("err", err)
+
 	errMsg := strings.ToLower(err.Error())
 	return strings.Contains(errMsg, "distance to target block exceeds maximum proof window") ||
 		strings.Contains(errMsg, "proof window") ||
@@ -163,15 +319,10 @@ func (v *trustlessValidator) GetAccountProof(
 	account geth.Address,
 	blockNumber *big.Int,
 ) (AccountResult, error) {
-	if v.config.GethURL == "" {
-		return AccountResult{}, fmt.Errorf("GethURL not configured")
-	}
-
-	client, err := ethclient.Dial(v.config.GethURL)
+	client, err := v.clientPool.getClient(ctx)
 	if err != nil {
-		return AccountResult{}, fmt.Errorf("failed to connect to blockchain node at %s: %w", v.config.GethURL, err)
+		return AccountResult{}, err
 	}
-	defer client.Close()
 
 	blockNumberHex := hexutil.EncodeBig(blockNumber)
 
@@ -439,10 +590,6 @@ func (v *trustlessValidator) isValidFromField(
 	gethTransaction *EthTypes.Transaction,
 	signer EthTypes.Signer,
 ) error {
-	// if v.config.RosettaCfg.Env == config.EnvProduction {
-	// 	return nil
-	// }
-
 	// Signer doesn't support this transaction type yet.
 	if gethTransaction.Type() == EthTypes.SetCodeTxType {
 		return nil
@@ -498,16 +645,24 @@ func (v *trustlessValidator) validateReceipts(
 }
 
 func (v *trustlessValidator) GetBlockStateRoot(ctx context.Context, blockNumber *big.Int) (geth.Hash, error) {
-	// Connect to the configured blockchain node
-	if v.config.GethURL == "" {
-		return geth.Hash{}, fmt.Errorf("GethURL not configured")
-	}
+	blockNum := blockNumber.Int64()
 
-	client, err := ethclient.Dial(v.config.GethURL)
-	if err != nil {
-		return geth.Hash{}, fmt.Errorf("failed to connect to blockchain node at %s: %w", v.config.GethURL, err)
+	// Check cache first
+	v.cacheMutex.RLock()
+	if entry, exists := v.stateRootCache[blockNum]; exists {
+		// Check if cache entry is still valid
+		if time.Since(entry.timestamp) < stateRootCacheTTL {
+			v.cacheMutex.RUnlock()
+			return entry.stateRoot, nil
+		}
 	}
-	defer client.Close()
+	v.cacheMutex.RUnlock()
+
+	// Connect to the configured blockchain node using pooled connection
+	client, err := v.clientPool.getClient(ctx)
+	if err != nil {
+		return geth.Hash{}, err
+	}
 
 	// Get the block by number
 	block, err := client.BlockByNumber(ctx, blockNumber)
@@ -517,6 +672,24 @@ func (v *trustlessValidator) GetBlockStateRoot(ctx context.Context, blockNumber 
 
 	// Extract state root from block header
 	stateRoot := block.Header().Root
+
+	// Cache the result with write lock
+	v.cacheMutex.Lock()
+	// Clean up old cache entries periodically
+	now := time.Now()
+	if len(v.stateRootCache) > stateRootCacheSize {
+		for blockNum, entry := range v.stateRootCache {
+			if now.Sub(entry.timestamp) > stateRootCacheTTL {
+				delete(v.stateRootCache, blockNum)
+			}
+		}
+	}
+
+	v.stateRootCache[blockNum] = &stateRootCacheEntry{
+		stateRoot: stateRoot,
+		timestamp: now,
+	}
+	v.cacheMutex.Unlock()
 
 	return stateRoot, nil
 }

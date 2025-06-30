@@ -17,6 +17,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/coinbase/rosetta-geth-sdk/configuration"
 	AssetTypes "github.com/coinbase/rosetta-geth-sdk/types"
@@ -28,10 +29,12 @@ import (
 
 // AccountAPIService implements the server.AccountAPIServicer interface.
 type AccountAPIService struct {
-	config *configuration.Configuration
-	types  *AssetTypes.Types
-	errors []*types.Error
-	client construction.Client
+	config    *configuration.Configuration
+	types     *AssetTypes.Types
+	errors    []*types.Error
+	client    construction.Client
+	validator validator.TrustlessValidator
+	once      sync.Once
 }
 
 // NewAccountAPIService returns a new *AccountAPIService.
@@ -46,6 +49,23 @@ func NewAccountAPIService(
 		types:  types,
 		errors: errors,
 		client: client,
+	}
+}
+
+// getValidator lazily initializes the validator instance
+func (s *AccountAPIService) getValidator() validator.TrustlessValidator {
+	s.once.Do(func() {
+		if s.config.IsTrustlessAccountValidationEnabled() {
+			s.validator = validator.NewEthereumValidator(s.config)
+		}
+	})
+	return s.validator
+}
+
+// Close cleans up resources when the service is shut down
+func (s *AccountAPIService) Close() {
+	if s.validator != nil {
+		s.validator.Close()
 	}
 }
 
@@ -77,12 +97,15 @@ func (s *AccountAPIService) AccountBalance(
 	if err != nil {
 		return nil, AssetTypes.WrapErr(AssetTypes.ErrInternalError, fmt.Errorf("could not get block hash given block identifier %v: %w", request.BlockIdentifier, err))
 	}
+
 	runValidation := s.config.IsTrustlessAccountValidationEnabled()
 	if runValidation {
-		v := validator.NewEthereumValidator(s.config)
-		err = v.ValidateAccount(ctx, balanceResponse, request.AccountIdentifier.Address)
-		if err != nil {
-			return nil, AssetTypes.WrapErr(AssetTypes.ErrGeth, err)
+		v := s.getValidator()
+		if v != nil {
+			err = v.ValidateAccount(ctx, balanceResponse, request.AccountIdentifier.Address)
+			if err != nil {
+				return nil, AssetTypes.WrapErr(AssetTypes.ErrGeth, err)
+			}
 		}
 	}
 
