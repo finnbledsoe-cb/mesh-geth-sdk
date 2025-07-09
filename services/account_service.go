@@ -16,6 +16,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/coinbase/rosetta-geth-sdk/configuration"
@@ -58,6 +59,13 @@ func (s *AccountAPIService) AccountBalance(
 	// 	return nil, AssetTypes.ErrUnavailableOffline
 	// }
 
+	reqJson, err := json.Marshal(request)
+	if err != nil {
+		fmt.Println("error marshaling request to json:", err)
+	} else {
+		fmt.Println("AccountBalance request JSON:", string(reqJson))
+	}
+
 	if request.AccountIdentifier == nil {
 		return nil, AssetTypes.ErrInvalidInput
 	}
@@ -69,12 +77,14 @@ func (s *AccountAPIService) AccountBalance(
 		request.Currencies,
 	)
 	if err != nil {
+		fmt.Println("error getting balance", err)
 		return nil, AssetTypes.WrapErr(AssetTypes.ErrGeth, err)
 	}
 
 	// get block hash if the block hash can't be calculated from keccak256 hash of its RLP encoding
 	balanceResponse.BlockIdentifier.Hash, err = s.client.GetBlockHash(ctx, *balanceResponse.BlockIdentifier)
 	if err != nil {
+		fmt.Println("error getting block hash", err)
 		return nil, AssetTypes.WrapErr(AssetTypes.ErrInternalError, fmt.Errorf("could not get block hash given block identifier %v: %w", request.BlockIdentifier, err))
 	}
 	runValidation := s.config.IsTrustlessAccountValidationEnabled()
@@ -84,6 +94,13 @@ func (s *AccountAPIService) AccountBalance(
 		if err != nil {
 			return nil, AssetTypes.WrapErr(AssetTypes.ErrGeth, err)
 		}
+	}
+
+	balanceResponseJson, err := json.Marshal(balanceResponse)
+	if err != nil {
+		fmt.Println("error marshaling balance response to json:", err)
+	} else {
+		fmt.Println("AccountBalance response JSON:", string(balanceResponseJson))
 	}
 
 	return balanceResponse, nil

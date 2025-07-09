@@ -158,6 +158,8 @@ func (ec *SDKClient) Balance(
 		nonce         hexutil.Uint64
 	)
 
+	fmt.Println("currencies", currencies)
+
 	// Get ETH balance, nonce, and bytecode of smart contract
 	blockNum := hexutil.EncodeUint64(header.Number.Uint64())
 	reqs := []rpc.BatchElem{

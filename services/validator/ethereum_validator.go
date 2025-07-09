@@ -59,6 +59,7 @@ type (
 
 const (
 	maxFromValidationRoutines = 10
+	ContractAddressMetadata   = "contractAddress"
 )
 
 type TrustlessValidator interface {
@@ -119,11 +120,10 @@ func (v *trustlessValidator) ValidateAccount(
 ) error {
 	addr := common.HexToAddress(address)
 
+	// Get account proof for native balance validation (no storage keys needed for user account)
 	result, err := v.GetAccountProof(ctx, addr, big.NewInt(balanceResponse.BlockIdentifier.Index))
 	if err != nil {
 		// Check if this is a proof window error - if so, skip validation gracefully
-		// This is caused if we are using a node with a low proof window, will not be a case
-		// On production and mainnet environments
 		if isProofWindowError(err) {
 			log.Printf("Skipping account validation: block %d is outside proof window\n", balanceResponse.BlockIdentifier.Index)
 			return nil
@@ -137,11 +137,281 @@ func (v *trustlessValidator) ValidateAccount(
 		return fmt.Errorf("failed to get block state root: %w", err)
 	}
 
-	// Run a Merkle Tree Proof on the state root and account
+	// Validate the basic account state (native balance, nonce, etc.)
 	err = v.ValidateAccountState(result, stateRoot, big.NewInt(balanceResponse.BlockIdentifier.Index))
 	if err != nil {
 		return err
 	}
+
+	// Validate ERC-20 token balances separately
+	err = v.ValidateERC20Balances(ctx, addr, balanceResponse.Balances, big.NewInt(balanceResponse.BlockIdentifier.Index))
+	if err != nil {
+		return fmt.Errorf("failed to validate ERC-20 token balances: %w", err)
+	}
+
+	return nil
+}
+
+// ValidateERC20Balances validates ERC-20 token balances by getting storage proofs from each contract
+func (v *trustlessValidator) ValidateERC20Balances(
+	ctx context.Context,
+	userAddr common.Address,
+	balances []*types.Amount,
+	blockNumber *big.Int,
+) error {
+	for _, balance := range balances {
+		// Skip native currency balances
+		if balance.Currency == nil || balance.Currency.Metadata == nil {
+			continue
+		}
+
+		contractAddr, ok := balance.Currency.Metadata[ContractAddressMetadata]
+		if !ok {
+			continue
+		}
+
+		fmt.Println("currency", balance.Currency)
+
+		contractAddress := common.HexToAddress(contractAddr.(string))
+
+		// Try to find the correct storage slot for this token
+		err := v.validateTokenBalanceWithSlotDetection(ctx, userAddr, contractAddress, balance, blockNumber)
+		if err != nil {
+			if isProofWindowError(err) {
+				log.Printf("Skipping ERC-20 validation for %s: block %d is outside proof window\n", contractAddress.Hex(), blockNumber.Int64())
+				continue
+			}
+			return fmt.Errorf("failed to validate balance for contract %s: %w", contractAddress.Hex(), err)
+		}
+	}
+
+	return nil
+}
+
+// validateTokenBalanceWithSlotDetection tries to validate token balance using configured slot or fallback methods
+func (v *trustlessValidator) validateTokenBalanceWithSlotDetection(
+	ctx context.Context,
+	userAddr common.Address,
+	contractAddress common.Address,
+	balance *types.Amount,
+	blockNumber *big.Int,
+) error {
+	// First, try to get the configured storage slot from token whitelist
+	var slotsToTry []int
+
+	// Check if we have token configuration with specific slot
+	if v.config != nil && v.config.RosettaCfg.TokenWhiteList != nil {
+		for _, token := range v.config.RosettaCfg.TokenWhiteList {
+			if strings.EqualFold(token.Address, contractAddress.Hex()) {
+				if token.BalancesSlot != nil {
+					slotsToTry = append(slotsToTry, int(*token.BalancesSlot))
+				} else {
+					slotsToTry = append(slotsToTry, 0)
+				}
+				break
+			}
+		}
+	}
+
+	// TODO: add a fallback to try common slots because defaulting to 0
+	// may not be the correct slot for all tokens
+
+	// Try each slot until we find one that works or exhaust all options
+	var lastErr error
+	for _, slot := range slotsToTry {
+		storageKey := calculateERC20BalanceStorageKey(userAddr, slot)
+
+		// Get storage proof from the contract
+		contractProof, err := v.GetAccountProofWithStorage(ctx, contractAddress, blockNumber, []string{storageKey})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Validate the storage proof and balance
+		err = v.ValidateERC20Balance(contractProof, storageKey, balance)
+		if err != nil {
+			// If the balance doesn't match, it might be the wrong slot - try next
+			if strings.Contains(err.Error(), "ERC-20 balance mismatch") {
+				lastErr = err
+				continue
+			}
+			// Other errors (like storage proof validation) should be returned immediately
+			return err
+		}
+
+		// Success! We found the correct slot
+		log.Printf("Successfully validated ERC-20 balance for %s using storage slot %d", contractAddress.Hex(), slot)
+		return nil
+	}
+
+	// If we get here, none of the slots worked
+	if lastErr != nil {
+		return fmt.Errorf("failed to validate ERC-20 balance using any storage slot (tried slots %v): %w", slotsToTry, lastErr)
+	}
+
+	return fmt.Errorf("failed to validate ERC-20 balance: no storage slots to try")
+}
+
+// calculateERC20BalanceStorageKey calculates the storage key for an ERC-20 token balance
+// For most ERC-20 tokens, balances are stored as: keccak256(userAddress + balancesMappingSlot)
+func calculateERC20BalanceStorageKey(userAddr common.Address, balancesMappingSlot int) string {
+	// Pad the user address to 32 bytes
+	paddedAddress := common.LeftPadBytes(userAddr.Bytes(), 32)
+
+	// Convert slot to 32 bytes
+	slotBytes := make([]byte, 32)
+	big.NewInt(int64(balancesMappingSlot)).FillBytes(slotBytes)
+
+	// Concatenate address + slot and hash: keccak256(userAddress + mappingSlot)
+	combined := append(paddedAddress, slotBytes...)
+	storageKey := crypto.Keccak256Hash(combined)
+
+	return storageKey.Hex()
+}
+
+// ValidateERC20Balance validates a single ERC-20 token balance using its storage proof
+func (v *trustlessValidator) ValidateERC20Balance(
+	contractProof AccountResult,
+	storageKey string,
+	expectedBalance *types.Amount,
+) error {
+	// Find the storage proof for this key
+	var storageProof *StorageResult
+	for i := range contractProof.StorageProof {
+		if contractProof.StorageProof[i].Key == storageKey {
+			storageProof = &contractProof.StorageProof[i]
+			break
+		}
+	}
+
+	if storageProof == nil {
+		return fmt.Errorf("missing storage proof for key %s", storageKey)
+	}
+
+	// Verify the storage proof
+	err := v.ValidateStorageProof(*storageProof, contractProof.StorageHash, storageKey)
+	if err != nil {
+		return fmt.Errorf("failed to validate storage proof: %w", err)
+	}
+
+	// Compare the proven value with the expected balance
+	expectedValue, ok := new(big.Int).SetString(expectedBalance.Value, 10)
+	if !ok {
+		return fmt.Errorf("invalid balance value: %s", expectedBalance.Value)
+	}
+
+	provenValue := storageProof.Value.ToInt()
+	if expectedValue.Cmp(provenValue) != 0 {
+		return fmt.Errorf(
+			"ERC-20 balance mismatch: expected %s, proven %s",
+			expectedValue.String(),
+			provenValue.String(),
+		)
+	}
+
+	return nil
+}
+
+// GetAccountProofWithStorage gets account proof including storage proofs for specified keys
+func (v *trustlessValidator) GetAccountProofWithStorage(
+	ctx context.Context,
+	account geth.Address,
+	blockNumber *big.Int,
+	storageKeys []string,
+) (AccountResult, error) {
+	if v.config.GethURL == "" {
+		return AccountResult{}, fmt.Errorf("GethURL not configured")
+	}
+
+	client, err := ethclient.Dial(v.config.GethURL)
+	if err != nil {
+		return AccountResult{}, fmt.Errorf("failed to connect to blockchain node at %s: %w", v.config.GethURL, err)
+	}
+	defer client.Close()
+
+	blockNumberHex := hexutil.EncodeBig(blockNumber)
+
+	// Get the account proof using eth_getProof with storage keys
+	var result AccountResult
+	err = client.Client().CallContext(ctx, &result, "eth_getProof", account, storageKeys, blockNumberHex)
+	if err != nil {
+		return AccountResult{}, fmt.Errorf("failed to get account proof: %w", err)
+	}
+
+	// Verify that this proofResult is for the target account
+	if result.Address.Hex() != account.Hex() {
+		return AccountResult{}, fmt.Errorf(
+			"the input proofResult has different account address, address in proof: %s, expected: %s",
+			result.Address.Hex(),
+			account,
+		)
+	}
+
+	return result, nil
+}
+
+// ValidateStorageProof validates a single storage proof against the storage root
+func (v *trustlessValidator) ValidateStorageProof(
+	storageProof StorageResult,
+	storageRoot geth.Hash,
+	storageKey string,
+) error {
+	if len(storageProof.Proof) == 0 {
+		// If proof is empty, the value should be zero (account doesn't exist in storage)
+		if storageProof.Value.ToInt().Cmp(big.NewInt(0)) != 0 {
+			return fmt.Errorf("non-zero value with empty proof")
+		}
+		return nil
+	}
+
+	// Create in-memory database for storage proof
+	proofDB := rawdb.NewMemoryDatabase()
+
+	// Store all proof nodes
+	for i, node := range storageProof.Proof {
+		nodeData, err := hexutil.Decode(node)
+		if err != nil {
+			return fmt.Errorf("failed to decode storage proof node %d: %w", i, err)
+		}
+		nodeHash := crypto.Keccak256(nodeData)
+		err = proofDB.Put(nodeHash, nodeData)
+		if err != nil {
+			return fmt.Errorf("failed to store storage proof node %d: %w", i, err)
+		}
+	}
+
+	// Parse storage key
+	keyBytes, err := hexutil.Decode(storageKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode storage key: %w", err)
+	}
+	keyHash := crypto.Keccak256(keyBytes)
+
+	// Verify the storage proof
+	value, err := trie.VerifyProof(storageRoot, keyHash, proofDB)
+	if err != nil {
+		return fmt.Errorf("storage proof verification failed: %w", err)
+	}
+
+	// If value is nil, it means the key doesn't exist (value is 0)
+	var provenValue *big.Int
+	if value == nil {
+		provenValue = big.NewInt(0)
+	} else {
+		provenValue = new(big.Int).SetBytes(value)
+	}
+
+	// Compare with the provided value
+	expectedValue := storageProof.Value.ToInt()
+	if provenValue.Cmp(expectedValue) != 0 {
+		return fmt.Errorf(
+			"storage value mismatch: expected %s, proven %s",
+			expectedValue.String(),
+			provenValue.String(),
+		)
+	}
+
 	return nil
 }
 
@@ -163,35 +433,8 @@ func (v *trustlessValidator) GetAccountProof(
 	account geth.Address,
 	blockNumber *big.Int,
 ) (AccountResult, error) {
-	if v.config.GethURL == "" {
-		return AccountResult{}, fmt.Errorf("GethURL not configured")
-	}
-
-	client, err := ethclient.Dial(v.config.GethURL)
-	if err != nil {
-		return AccountResult{}, fmt.Errorf("failed to connect to blockchain node at %s: %w", v.config.GethURL, err)
-	}
-	defer client.Close()
-
-	blockNumberHex := hexutil.EncodeBig(blockNumber)
-
-	// Get the account proof using eth_getProof
-	var result AccountResult
-	err = client.Client().CallContext(ctx, &result, "eth_getProof", account, []string{}, blockNumberHex)
-	if err != nil {
-		return AccountResult{}, fmt.Errorf("failed to get account proof: %w", err)
-	}
-
-	// Verify that this proofResult is for the target account
-	if result.Address.Hex() != account.Hex() {
-		return AccountResult{}, fmt.Errorf(
-			"the input proofResult has different account address, address in proof: %s, expected: %s",
-			result.Address.Hex(),
-			account,
-		)
-	}
-
-	return result, nil
+	// Use the enhanced method with no storage keys for backwards compatibility
+	return v.GetAccountProofWithStorage(ctx, account, blockNumber, []string{})
 }
 
 func (v *trustlessValidator) ValidateAccountState(

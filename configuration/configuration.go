@@ -147,11 +147,12 @@ type RosettaConfig struct {
 }
 
 type Token struct {
-	ChainID  uint64 `json:"chainId"`
-	Address  string `json:"address"`
-	Name     string `json:"name"`
-	Symbol   string `json:"symbol"`
-	Decimals uint64 `json:"decimals"`
+	ChainID      uint64  `json:"chainId"`
+	Address      string  `json:"address"`
+	Name         string  `json:"name"`
+	Symbol       string  `json:"symbol"`
+	Decimals     uint64  `json:"decimals"`
+	BalancesSlot *uint64 `json:"balancesSlot,omitempty"` // Storage slot where balances mapping is stored (optional, defaults to 0)
 }
 
 // Mode is the setting that determines if
