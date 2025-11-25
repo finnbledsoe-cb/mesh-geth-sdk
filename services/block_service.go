@@ -310,8 +310,11 @@ func (s *BlockAPIService) GetBlock(
 	// otherwise, only body.Hash is populated. body.Transactions is empty.
 	// TODO(xiaying): log warn if len(body.Hash) > 1 && len(body.txs) == 0
 
+	// Cache config to avoid multiple calls
+	rosettaConfig := s.client.GetRosettaConfig()
+
 	var blockAuthor string
-	if s.client.GetRosettaConfig().SupportsBlockAuthor {
+	if rosettaConfig.SupportsBlockAuthor {
 		blockAuthor, err = s.client.BlockAuthor(ctx, head.Number.Int64())
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("could not get block author for %x: %w", body.Hash[:], err)
@@ -323,7 +326,7 @@ func (s *BlockAPIService) GetBlock(
 	if head.Number.Int64() != AssetTypes.GenesisBlockIndex {
 		addTraces = true
 		// Use open ethereum trace API if selected.
-		if s.client.GetRosettaConfig().TraceType == configuration.OpenEthereumTrace {
+		if rosettaConfig.TraceType == configuration.OpenEthereumTrace {
 			m, err = s.client.TraceReplayBlockTransactions(ctx, body.Hash.String())
 		} else {
 			m, err = s.client.TraceBlockByHash(ctx, body.Hash, body.Transactions)
@@ -343,7 +346,7 @@ func (s *BlockAPIService) GetBlock(
 		loadedTxs[i].Transaction = txs[i]
 		loadedTxs[i].BaseFee = head.BaseFee
 
-		if s.client.GetRosettaConfig().SupportsBlockAuthor {
+		if rosettaConfig.SupportsBlockAuthor {
 			loadedTxs[i].Author = client.MustChecksum(blockAuthor)
 		} else {
 			loadedTxs[i].Miner = client.MustChecksum(head.Coinbase.Hex())
@@ -361,7 +364,7 @@ func (s *BlockAPIService) GetBlock(
 	}
 
 	uncles := []*EthTypes.Header{}
-	if s.client.GetRosettaConfig().SupportRewardTx {
+	if rosettaConfig.SupportRewardTx {
 		uncles, err = s.client.GetUncles(ctx, &head, &body)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("unable to get uncles: %w", err)
@@ -371,6 +374,7 @@ func (s *BlockAPIService) GetBlock(
 	return EthTypes.NewBlockWithHeader(&head).WithBody(EthTypes.Body{
 		Transactions: txs,
 		Uncles:       uncles,
+		Withdrawals:  body.Withdrawals,
 	}), loadedTxs, &body, nil
 }
 
