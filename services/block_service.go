@@ -281,70 +281,50 @@ func (s *BlockAPIService) GetBlock(
 	*client.RPCBlock,
 	error,
 ) {
-	log.Printf("GetBlock called: method=%s, args=%v", blockMethod, args)
-
 	var raw json.RawMessage
 	err := s.client.CallContext(ctx, &raw, blockMethod, args...)
 	if err != nil {
-		log.Printf("GetBlock: CallContext failed: %v", err)
 		return nil, nil, nil, fmt.Errorf("block fetch failed: %w", err)
 	} else if len(raw) == 0 {
-		log.Printf("GetBlock: received empty response")
 		return nil, nil, nil, goEthereum.NotFound
 	}
-	log.Printf("GetBlock: received raw block data, size=%d bytes", len(raw))
 
 	// Decode header and transactions
 	var head EthTypes.Header
 	var body client.RPCBlock
 	if err := json.Unmarshal(raw, &head); err != nil {
-		log.Printf("GetBlock: failed to unmarshal header: %v", err)
 		return nil, nil, nil, err
 	}
-	log.Printf("GetBlock: unmarshaled header for block %s", head.Number.String())
-
 	if s.config.RosettaCfg.SupportCustomizedBlockBody {
-		log.Printf("GetBlock: using customized block body parsing")
 		err = s.client.GetCustomizedBlockBody(raw, &body)
 		if err != nil {
-			log.Printf("GetBlock: failed to get customized block body: %v", err)
 			return nil, nil, nil, err
 		}
 	} else {
 		if err := json.Unmarshal(raw, &body); err != nil {
-			log.Printf("GetBlock: failed to unmarshal body: %v", err)
 			return nil, nil, nil, err
 		}
 	}
-	log.Printf("GetBlock: unmarshaled body successfully")
-
-	log.Printf("Block %s: parsed header hash=%s, body hash=%s, txs=%d, uncles=%d, withdrawals=%d",
-		head.Number.String(), head.Hash().Hex(), body.Hash.Hex(),
-		len(body.Transactions), len(body.UncleHashes), len(body.Withdrawals))
 
 	// Note: We need a full node to return a complete RPCBlock,
 	// otherwise, only body.Hash is populated. body.Transactions is empty.
 	// TODO(xiaying): log warn if len(body.Hash) > 1 && len(body.txs) == 0
 
-	// Cache config to avoid multiple calls during logging
+	// Cache config to avoid multiple calls
 	rosettaConfig := s.client.GetRosettaConfig()
 
 	var blockAuthor string
 	if rosettaConfig.SupportsBlockAuthor {
-		log.Printf("GetBlock %s: fetching block author", head.Number.String())
 		blockAuthor, err = s.client.BlockAuthor(ctx, head.Number.Int64())
 		if err != nil {
-			log.Printf("GetBlock %s: failed to get block author: %v", head.Number.String(), err)
 			return nil, nil, nil, fmt.Errorf("could not get block author for %x: %w", body.Hash[:], err)
 		}
-		log.Printf("GetBlock %s: block author=%s", head.Number.String(), blockAuthor)
 	}
 
 	var m map[string][]*client.FlatCall
 	var addTraces bool
 	if head.Number.Int64() != AssetTypes.GenesisBlockIndex {
 		addTraces = true
-		log.Printf("GetBlock %s: fetching traces (type=%d)", head.Number.String(), rosettaConfig.TraceType)
 		// Use open ethereum trace API if selected.
 		if rosettaConfig.TraceType == configuration.OpenEthereumTrace {
 			m, err = s.client.TraceReplayBlockTransactions(ctx, body.Hash.String())
@@ -353,14 +333,11 @@ func (s *BlockAPIService) GetBlock(
 		}
 
 		if err != nil {
-			log.Printf("GetBlock %s: failed to fetch traces: %v", head.Number.String(), err)
 			return nil, nil, nil, err
 		}
-		log.Printf("GetBlock %s: fetched %d trace entries", head.Number.String(), len(m))
 	}
 
 	// Convert all txs to loaded txs
-	log.Printf("GetBlock %s: processing %d transactions", head.Number.String(), len(body.Transactions))
 	txs := make([]*EthTypes.Transaction, len(body.Transactions))
 	loadedTxs := make([]*client.LoadedTransaction, len(body.Transactions))
 	for i, tx := range body.Transactions {
@@ -385,30 +362,20 @@ func (s *BlockAPIService) GetBlock(
 			loadedTxs[i].Trace = flattenedCalls
 		}
 	}
-	log.Printf("GetBlock %s: processed all transactions", head.Number.String())
 
 	uncles := []*EthTypes.Header{}
 	if rosettaConfig.SupportRewardTx {
-		log.Printf("GetBlock %s: fetching uncles", head.Number.String())
 		uncles, err = s.client.GetUncles(ctx, &head, &body)
 		if err != nil {
-			log.Printf("GetBlock %s: failed to get uncles: %v", head.Number.String(), err)
 			return nil, nil, nil, fmt.Errorf("unable to get uncles: %w", err)
 		}
-		log.Printf("GetBlock %s: fetched %d uncles", head.Number.String(), len(uncles))
 	}
 
-	log.Printf("GetBlock %s: reconstructing block with txs=%d, uncles=%d, withdrawals=%d",
-		head.Number.String(), len(txs), len(uncles), len(body.Withdrawals))
-
-	reconstructedBlock := EthTypes.NewBlockWithHeader(&head).WithBody(EthTypes.Body{
+	return EthTypes.NewBlockWithHeader(&head).WithBody(EthTypes.Body{
 		Transactions: txs,
 		Uncles:       uncles,
 		Withdrawals:  body.Withdrawals,
-	})
-
-	log.Printf("GetBlock %s: completed successfully", head.Number.String())
-	return reconstructedBlock, loadedTxs, &body, nil
+	}), loadedTxs, &body, nil
 }
 
 // Block implements the /block endpoint.
@@ -416,13 +383,6 @@ func (s *BlockAPIService) Block(
 	ctx context.Context,
 	request *RosettaTypes.BlockRequest,
 ) (*RosettaTypes.BlockResponse, *RosettaTypes.Error) {
-	if request.BlockIdentifier != nil {
-		log.Printf("Block endpoint called: index=%v, hash=%v",
-			request.BlockIdentifier.Index, request.BlockIdentifier.Hash)
-	} else {
-		log.Printf("Block endpoint called: blockIdentifier=nil (latest block)")
-	}
-
 	if s.config.IsOfflineMode() {
 		return nil, AssetTypes.ErrUnavailableOffline
 	}
@@ -432,15 +392,12 @@ func (s *BlockAPIService) Block(
 		parentBlockIdentifier *RosettaTypes.BlockIdentifier
 	)
 
-	log.Printf("Block endpoint: calling GetEthBlock")
 	block, loadedTxns, rpcBlock, err := s.GetEthBlock(ctx, request.BlockIdentifier)
 	if errors.Is(err, AssetTypes.ErrClientBlockOrphaned) {
-		log.Printf("Block endpoint: block orphaned error: %v", err)
 		return nil, AssetTypes.WrapErr(AssetTypes.ErrBlockOrphaned, err)
 	}
 
 	if err != nil {
-		log.Printf("Block endpoint: GetEthBlock failed: %v", err)
 		return nil, AssetTypes.WrapErr(AssetTypes.ErrGeth, err)
 	}
 
@@ -503,9 +460,6 @@ func (s *BlockAPIService) Block(
 	if err != nil {
 		return nil, AssetTypes.WrapErr(AssetTypes.ErrGeth, err)
 	}
-
-	log.Printf("Block endpoint: successfully constructed block response for block %d with %d transactions",
-		block.Number().Int64(), len(append(transactions, crossTxns...)))
 
 	return &RosettaTypes.BlockResponse{
 		Block: &RosettaTypes.Block{
