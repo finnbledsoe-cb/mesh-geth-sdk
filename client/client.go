@@ -321,6 +321,8 @@ func (ec *SDKClient) blockHeader(
 	if err == nil && header == nil {
 		return nil, goEthereum.NotFound
 	}
+
+	fmt.Println("header", header)
 	return header, err
 }
 

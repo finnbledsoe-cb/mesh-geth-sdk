@@ -67,10 +67,10 @@ type ContractCurrency struct {
 }
 
 type RPCBlock struct {
-	Hash         common.Hash             `json:"hash"`
-	Transactions []RPCTransaction        `json:"transactions"`
-	UncleHashes  []common.Hash           `json:"uncles"`
-	Withdrawals  []*EthTypes.Withdrawal  `json:"withdrawals"`
+	Hash         common.Hash            `json:"hash"`
+	Transactions []RPCTransaction       `json:"transactions"`
+	UncleHashes  []common.Hash          `json:"uncles"`
+	Withdrawals  []*EthTypes.Withdrawal `json:"withdrawals"`
 }
 
 type TxExtraInfo struct {
