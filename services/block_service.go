@@ -371,6 +371,7 @@ func (s *BlockAPIService) GetBlock(
 	return EthTypes.NewBlockWithHeader(&head).WithBody(EthTypes.Body{
 		Transactions: txs,
 		Uncles:       uncles,
+		Withdrawals:  body.Withdrawals,
 	}), loadedTxs, &body, nil
 }
 
