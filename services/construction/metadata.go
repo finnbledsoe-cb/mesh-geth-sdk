@@ -103,6 +103,18 @@ func (s APIService) ConstructionMetadata( //nolint
 			if err != nil {
 				return nil, sdkTypes.WrapErr(sdkTypes.ErrERC20GasLimitError, err)
 			}
+		case s.config.RosettaCfg.NativeTokenContractAddress != "" &&
+			(input.Currency == nil || types.Hash(input.Currency) == types.Hash(s.config.RosettaCfg.Currency)):
+			// Native token is an ERC20 -- estimate gas for contract call
+			value := new(big.Int)
+			value.SetString(input.Value, 10) // nolint:gomnd
+			transferData := client.GenerateErc20TransferData(input.To, value)
+			gasLimit, err = s.client.GetContractCallGasLimit(
+				ctx, s.config.RosettaCfg.NativeTokenContractAddress, input.From, big.NewInt(0), transferData,
+			)
+			if err != nil {
+				return nil, sdkTypes.WrapErr(sdkTypes.ErrERC20GasLimitError, err)
+			}
 		case input.Currency == nil || types.Hash(input.Currency) == types.Hash(s.config.RosettaCfg.Currency):
 			value := new(big.Int)
 			value.SetString(input.Value, 10) // nolint:gomnd

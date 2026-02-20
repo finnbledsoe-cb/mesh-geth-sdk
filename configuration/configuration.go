@@ -85,6 +85,12 @@ type RosettaConfig struct {
 	// Currency is the native currency blockchain supports
 	Currency *RosettaTypes.Currency
 
+	// NativeTokenContractAddress is the ERC20 contract address of the chain's native fee
+	// token. When set, construction endpoints build ERC20 transfers (to=contract,
+	// data=transfer(...), value=0) instead of native value transfers. Leave empty for
+	// chains with a standard native coin.
+	NativeTokenContractAddress string
+
 	// TracePrefix is the prefix appended to trace RPC calls
 	TracePrefix string
 

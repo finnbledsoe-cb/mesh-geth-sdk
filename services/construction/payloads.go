@@ -117,6 +117,12 @@ func (s *APIService) ConstructionPayloads(
 		}
 		transferData = contractData
 		sendToAddress = common.HexToAddress(to)
+	case s.config.RosettaCfg.NativeTokenContractAddress != "" &&
+		types.Hash(fromCurrency) == types.Hash(s.config.RosettaCfg.Currency):
+		// Native token is an ERC20 -- build ERC20 transfer
+		transferData = client.GenerateErc20TransferData(toAddress, amount)
+		sendToAddress = common.HexToAddress(s.config.RosettaCfg.NativeTokenContractAddress)
+		amount = big.NewInt(0)
 	case types.Hash(fromCurrency) == types.Hash(s.config.RosettaCfg.Currency):
 		// Native currency logic
 		transferData = []byte{}
